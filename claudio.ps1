@@ -1,8 +1,11 @@
-# claudio — escolhe um diretório usado recentemente com o Claude e abre uma sessão nova nele.
+﻿# claudio — escolhe um diretório usado recentemente com o Claude e abre uma sessão nova nele.
 # Teclas: ↑/↓ navegar · digitar filtra · Enter abre · Ctrl+F favorita · Esc sai
 # Se o filtro for um caminho existente, Enter abre esse caminho.
 
 $ErrorActionPreference = 'Stop'
+# Console do Windows costuma estar em codepage 850/437: ★ … ↑↓ viram "?".
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+[Console]::InputEncoding  = [System.Text.Encoding]::UTF8
 $projectsDir = Join-Path $HOME '.claude\projects'
 $stateDir    = Join-Path $HOME '.claudio'
 $favFile     = Join-Path $stateDir 'favorites.json'
