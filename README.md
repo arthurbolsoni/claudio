@@ -6,7 +6,7 @@ TUI para Windows que lista os diretórios onde você usou o [Claude Code](https:
 cd <dir> && claude --dangerously-skip-permissions
 ```
 
-Os diretórios vêm do campo `cwd` das sessões em `~/.claude/projects`. A lista é ordenada por último uso, com os favoritos no topo.
+Os diretórios vêm do campo `cwd` das sessões em `~/.claude/projects`. Os diretórios aparecem como cards em dois blocos: Favoritos em cima e Recentes embaixo, cada um ordenado por último uso.
 
 ## Instalação
 
@@ -23,7 +23,7 @@ O `install.ps1` cria `~/.local/bin/claudio.cmd`, então `~/.local/bin` precisa e
 
 | Tecla | Ação |
 |---|---|
-| ↑ ↓ PgUp PgDn Home End | navegar |
+| ← → ↑ ↓ PgUp PgDn Home End | navegar entre os cards |
 | digitar | filtrar (vários termos separados por espaço) |
 | Enter | abrir sessão no diretório |
 | Ctrl+F | marcar/desmarcar favorito |
