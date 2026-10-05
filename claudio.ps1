@@ -89,8 +89,8 @@ function Render-Panel([string]$title, [int[]]$idx, [int]$top, [int]$rowsH, [int]
         $n = $top + $r
         if ($n -ge $idx.Count) { $out += "$b│$e[0m$(' ' * ($w - 2))$b│$e[0m"; continue }
         $i = $idx[$n]; $it = $view[$i]
-        $meta = if ($it.Count) { '{0,6} {1,4}x' -f (Format-Ago $it.Last), $it.Count } else { '' }
-        $text = (Fit $it.Path ($iw - 13)) + $meta.PadLeft(13)
+        $meta = if ($it.Count) { '{0,9} · {1,-11}' -f ('há ' + (Format-Ago $it.Last)), ('{0} {1}' -f $it.Count, $(if ($it.Count -eq 1) { 'sessão' } else { 'sessões' })) } else { '' }
+        $text = (Fit $it.Path ($iw - 24)) + $meta.PadLeft(24)
         $style = if ($i -eq $sel) { "$e[7m" } elseif (-not $it.Exists) { "$e[9;2m" } else { '' }
         $out += "$b│$e[0m $style$text$e[0m $b│$e[0m"
     }
