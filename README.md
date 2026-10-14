@@ -34,6 +34,8 @@ Argumentos extras são repassados ao `claude`: `claudio --continue`.
 
 Favoritos ficam em `~/.claudio/favorites.json`. Diretórios que não existem mais aparecem riscados.
 
+O `cwd` de cada pasta de `~/.claude/projects` fica em cache em `~/.claudio/cwd-cache.json`; só pasta nova tem arquivo de sessão aberto. Apagar o arquivo força a releitura.
+
 ## Contas
 
 Cada pasta de configuração do Claude Code com login é uma conta: `~/.claude` é a conta 1 e cada `~/.claude-*` com `.credentials.json` vem em seguida, em ordem alfabética. As contas além da 1 abrem com `CLAUDE_CONFIG_DIR` apontando para a pasta delas.

@@ -12,6 +12,7 @@ $projectsDir = Join-Path $HOME '.claude\projects'
 $stateDir    = Join-Path $HOME '.claudio'
 $favFile     = Join-Path $stateDir 'favorites.json'
 $stateFile   = Join-Path $stateDir 'state.json'
+$cwdCacheFile = Join-Path $stateDir 'cwd-cache.json'
 $e = [char]27
 
 function Load-Favorites {
@@ -34,28 +35,53 @@ function Save-State([string]$account) {
 
 function Get-Key([string]$path) { $path.ToLower().TrimEnd('\') }
 
+# Primeiro "cwd" nos 512 KB iniciais da sessão. Ler por linha é lento: a 1ª linha pode ter vários MB.
+function Find-Cwd([string]$file) {
+    try {
+        $fs = [IO.FileStream]::new($file, 'Open', 'Read', 'ReadWrite, Delete')
+        try {
+            $buf = [byte[]]::new(512KB)
+            $n = $fs.Read($buf, 0, $buf.Length)
+        } finally { $fs.Dispose() }
+        if ([Text.Encoding]::UTF8.GetString($buf, 0, $n) -match '"cwd":"((?:[^"\\]|\\.)*)"') { return $Matches[1] -replace '\\\\', '\' }
+    } catch { }
+}
+
 # Lê o "cwd" real das sessões (o nome da pasta em ~/.claude/projects é lossy).
+# O cwd de cada pasta de projeto fica em ~/.claudio/cwd-cache.json; só pasta nova abre arquivo.
 function Get-RecentDirs {
+    $cache = @{}
+    $saved = Read-Json $cwdCacheFile
+    if ($saved) { foreach ($p in $saved.PSObject.Properties) { $cache[$p.Name] = $p.Value } }
+    $dirty = $false
     $byPath = @{}
-    foreach ($proj in Get-ChildItem $projectsDir -Directory -ErrorAction SilentlyContinue) {
-        $sessions = @(Get-ChildItem $proj.FullName -Filter *.jsonl -File | Sort-Object LastWriteTime -Descending)
-        if (-not $sessions) { continue }
-        $cwd = $null
-        foreach ($s in $sessions | Select-Object -First 3) {
-            foreach ($line in Get-Content $s.FullName -TotalCount 50) {
-                if ($line -match '"cwd":"((?:[^"\\]|\\.)*)"') { $cwd = $Matches[1] -replace '\\\\', '\'; break }
+    if (-not [IO.Directory]::Exists($projectsDir)) { return }
+    foreach ($proj in [IO.DirectoryInfo]::new($projectsDir).GetDirectories()) {
+        $sessions = $proj.GetFiles('*.jsonl')
+        if (-not $sessions.Count) { continue }
+        $last = $sessions[0].LastWriteTime
+        foreach ($s in $sessions) { if ($s.LastWriteTime -gt $last) { $last = $s.LastWriteTime } }
+        $cwd = $cache[$proj.Name]
+        if (-not $cwd) {
+            foreach ($s in $sessions | Sort-Object LastWriteTime -Descending | Select-Object -First 3) {
+                $cwd = Find-Cwd $s.FullName
+                if ($cwd) { $cache[$proj.Name] = $cwd; $dirty = $true; break }
             }
-            if ($cwd) { break }
         }
         if (-not $cwd) { continue }
         $key = Get-Key $cwd
-        $last = $sessions[0].LastWriteTime
         if ($byPath.ContainsKey($key)) {
             $byPath[$key].Count += $sessions.Count
             if ($last -gt $byPath[$key].Last) { $byPath[$key].Last = $last }
         } else {
             $byPath[$key] = [pscustomobject]@{ Path = $cwd; Last = $last; Count = $sessions.Count }
         }
+    }
+    if ($dirty) {
+        try {
+            if (-not (Test-Path $stateDir)) { New-Item -ItemType Directory $stateDir | Out-Null }
+            ConvertTo-Json -InputObject $cache | Set-Content $cwdCacheFile -Encoding utf8
+        } catch { }
     }
     $byPath.Values
 }
@@ -86,6 +112,22 @@ function To-Local($v) {
     [datetimeoffset]::Parse([string]$v).LocalDateTime
 }
 
+# O .claude.json passa de 100 KB e ConvertFrom-Json nele custa ~50 ms: tira só os dois campos usados.
+function Read-AccountConfig([string]$path) {
+    if (-not (Test-Path -LiteralPath $path)) { return }
+    try {
+        $doc = [Text.Json.JsonDocument]::Parse([IO.File]::ReadAllText($path))
+        try {
+            $cfg = @{}
+            foreach ($name in 'oauthAccount', 'cachedUsageUtilization') {
+                $v = [Text.Json.JsonElement]::new()
+                if ($doc.RootElement.TryGetProperty($name, [ref]$v)) { $cfg[$name] = $v.GetRawText() | ConvertFrom-Json }
+            }
+            [pscustomobject]$cfg
+        } finally { $doc.Dispose() }
+    } catch { }
+}
+
 function Get-Accounts {
     $dirs = @(Join-Path $HOME '.claude') + @(Get-ChildItem $HOME -Directory -Force -Filter '.claude-*' |
         Where-Object { Test-Path (Join-Path $_.FullName '.credentials.json') } | Sort-Object Name | ForEach-Object FullName)
@@ -94,7 +136,7 @@ function Get-Accounts {
         $n++
         $default = $n -eq 1
         # Sem CLAUDE_CONFIG_DIR o .claude.json fica em ~, não dentro de ~/.claude.
-        $cfg = Read-Json $(if ($default) { Join-Path $HOME '.claude.json' } else { Join-Path $dir '.claude.json' })
+        $cfg = Read-AccountConfig $(if ($default) { Join-Path $HOME '.claude.json' } else { Join-Path $dir '.claude.json' })
         $cred = (Read-Json (Join-Path $dir '.credentials.json')).claudeAiOauth
         $plan = ''
         if ($cred.subscriptionType) {
@@ -211,32 +253,42 @@ function Wait-Key {
     while (-not [Console]::KeyAvailable) {
         if (Update-Usage) { return $null }
         if ([Console]::WindowWidth -ne $w -or [Console]::WindowHeight -ne $h) { return $null }
-        Start-Sleep -Milliseconds 40
+        Start-Sleep -Milliseconds 10
     }
     [Console]::ReadKey($true)
 }
 
-$accounts = @(Get-Accounts)
-foreach ($a in $accounts) { try { Start-Usage $a } catch { $a.State = 'erro'; $a.Note = "$_" } }
-$lastAccount = (Read-Json $stateFile).account
+# Contas e uso carregam depois do primeiro quadro (Load-Accounts no loop principal).
+$accounts = $null
+function Load-Accounts {
+    $script:accounts = @(Get-Accounts)
+    foreach ($a in $script:accounts) { try { Start-Usage $a } catch { $a.State = 'erro'; $a.Note = "$_" } }
+    $script:lastAccount = (Read-Json $stateFile).account
+}
 
 $recent = @(Get-RecentDirs)
 $favorites = [System.Collections.Generic.List[string]]::new()
 foreach ($f in Load-Favorites) { $favorites.Add($f) }
 
+# Lower e Meta saem prontos daqui: o filtro e o desenho rodam a cada tecla.
+function New-Row([string]$path, [datetime]$last, [int]$count, [bool]$fav) {
+    $meta = if ($count) { '{0,9} · {1,-11}' -f ('há ' + (Format-Ago $last)), ('{0} {1}' -f $count, $(if ($count -eq 1) { 'sessão' } else { 'sessões' })) } else { '' }
+    [pscustomobject]@{ Path = $path; Lower = $path.ToLower(); Last = $last; Count = $count; Fav = $fav; Meta = $meta.PadLeft(24); Exists = [IO.Directory]::Exists($path) }
+}
+
 function Build-Items {
     $favSet = @{}; foreach ($f in $favorites) { $favSet[(Get-Key $f)] = $true }
+    $known = @{}
     $items = foreach ($r in $recent) {
-        [pscustomobject]@{ Path = $r.Path; Last = $r.Last; Count = $r.Count; Fav = $favSet.ContainsKey((Get-Key $r.Path)) }
+        $k = Get-Key $r.Path
+        $known[$k] = $true
+        New-Row $r.Path $r.Last $r.Count $favSet.ContainsKey($k)
     }
     # Favoritos que não aparecem nas sessões continuam na lista.
-    $known = @{}; foreach ($i in $items) { $known[(Get-Key $i.Path)] = $true }
     $extra = foreach ($f in $favorites) {
-        if (-not $known.ContainsKey((Get-Key $f))) { [pscustomobject]@{ Path = $f; Last = [datetime]::MinValue; Count = 0; Fav = $true } }
+        if (-not $known.ContainsKey((Get-Key $f))) { New-Row $f ([datetime]::MinValue) 0 $true }
     }
-    $list = @(@($items) + @($extra) | Sort-Object @{ e = { -not $_.Fav } }, @{ e = { $_.Last }; Descending = $true })
-    foreach ($i in $list) { $i | Add-Member Exists (Test-Path -LiteralPath $i.Path -PathType Container) }
-    $list
+    @(@($items) + @($extra) | Sort-Object @{ e = { -not $_.Fav } }, @{ e = { $_.Last }; Descending = $true })
 }
 
 function Fit([string]$text, [int]$n) {
@@ -262,6 +314,7 @@ function Bar([double]$p, [int]$w) {
 
 # Linha do topo da lista: uso de sessão e semana de cada conta.
 function Format-Summary([int]$w) {
+    if ($null -eq $accounts) { return " $e[2mcarregando contas…$e[0m" }
     $parts = foreach ($a in $accounts) {
         $body = switch ($a.State) {
             'carregando' { "$e[2m…$e[0m" }
@@ -312,8 +365,7 @@ function Render-Panel([string]$title, [int[]]$idx, [int]$top, [int]$rowsH, [int]
         $n = $top + $r
         if ($n -ge $idx.Count) { $out += "$b│$e[0m$(' ' * ($w - 2))$b│$e[0m"; continue }
         $i = $idx[$n]; $it = $view[$i]
-        $meta = if ($it.Count) { '{0,9} · {1,-11}' -f ('há ' + (Format-Ago $it.Last)), ('{0} {1}' -f $it.Count, $(if ($it.Count -eq 1) { 'sessão' } else { 'sessões' })) } else { '' }
-        $text = (Fit $it.Path ($iw - 24)) + $meta.PadLeft(24)
+        $text = (Fit $it.Path ($iw - 24)) + $it.Meta
         $style = if ($i -eq $sel) { "$e[7m" } elseif (-not $it.Exists) { "$e[9;2m" } else { '' }
         $out += "$b│$e[0m $style$text$e[0m $b│$e[0m"
     }
@@ -371,24 +423,31 @@ $favTop = 0
 $recTop = 0
 $focusPath = $null
 
+# Recalcula $view, $favIdx e $recIdx; roda no escopo do loop (dot-source).
+$refreshView = {
+    $view = @(if ($filter) {
+        $terms = $filter.ToLower().Split(' ', [StringSplitOptions]::RemoveEmptyEntries)
+        foreach ($it in $all) {
+            $ok = $true
+            foreach ($t in $terms) { if (-not $it.Lower.Contains($t)) { $ok = $false; break } }
+            if ($ok) { $it }
+        }
+    } else { $all })
+    if ($focusPath) {
+        for ($i = 0; $i -lt $view.Count; $i++) { if ($view[$i].Path -eq $focusPath) { $sel = $i } }
+        $focusPath = $null
+    }
+    if ($sel -ge $view.Count) { $sel = [Math]::Max(0, $view.Count - 1) }
+    # $view já vem com favoritos primeiro.
+    $favIdx = [int[]]@(for ($i = 0; $i -lt $view.Count; $i++) { if ($view[$i].Fav) { $i } })
+    $recIdx = [int[]]@(for ($i = 0; $i -lt $view.Count; $i++) { if (-not $view[$i].Fav) { $i } })
+}
+. $refreshView
+
 [Console]::TreatControlCAsInput = $true
 [Console]::Write("$e[?1049h$e[?25l")
 try {
     while ($true) {
-        $view = @(if ($filter) {
-            $terms = $filter.ToLower() -split '\s+' | Where-Object { $_ }
-            $all | Where-Object { $p = $_.Path.ToLower(); -not ($terms | Where-Object { -not $p.Contains($_) }) }
-        } else { $all })
-        if ($focusPath) {
-            for ($i = 0; $i -lt $view.Count; $i++) { if ($view[$i].Path -eq $focusPath) { $sel = $i } }
-            $focusPath = $null
-        }
-        if ($sel -ge $view.Count) { $sel = [Math]::Max(0, $view.Count - 1) }
-
-        # $view já vem com favoritos primeiro.
-        $favIdx = [int[]]@(for ($i = 0; $i -lt $view.Count; $i++) { if ($view[$i].Fav) { $i } })
-        $recIdx = [int[]]@(for ($i = 0; $i -lt $view.Count; $i++) { if (-not $view[$i].Fav) { $i } })
-
         $width = [Console]::WindowWidth - 1
         $avail = [Console]::WindowHeight - 4
         $panels = [int]($favIdx.Count -gt 0) + [int]($recIdx.Count -gt 0)
@@ -413,8 +472,9 @@ try {
         $favTop = [Math]::Max(0, [Math]::Min($favTop, $favIdx.Count - $favRows))
         $recTop = [Math]::Max(0, [Math]::Min($recTop, $recIdx.Count - $recRows))
 
+        # ?2026 = synchronized output: o terminal pinta o quadro inteiro de uma vez, sem piscar.
         $sb = [System.Text.StringBuilder]::new()
-        [void]$sb.Append("$e[H")
+        [void]$sb.Append("$e[?2026h$e[H")
         [void]$sb.Append("$e[1;35m claudio$e[0m  $e[2m↑↓ navegar · digitar filtra · Enter abre · Ctrl+F favorito · Esc sai$e[0m$e[K`n")
         [void]$sb.Append("$(Format-Summary $width)$e[K`n")
         [void]$sb.Append(" $e[36m>$e[0m $filter$e[7m $e[0m$e[K`n$e[K`n")
@@ -422,47 +482,54 @@ try {
             $hint = if ($filter -and (Test-Path -LiteralPath $filter -PathType Container)) { 'Enter abre esse caminho' } else { 'nada encontrado' }
             [void]$sb.Append("   $e[2m$hint$e[0m$e[K`n")
         }
-        $lines = @()
-        if ($favIdx.Count) { $lines += Render-Panel '★ Favoritos' $favIdx $favTop $favRows $width }
-        if ($recIdx.Count) { $lines += Render-Panel 'Recentes' $recIdx $recTop $recRows $width }
-        foreach ($l in $lines) { [void]$sb.Append("$l$e[K`n") }
-        [void]$sb.Append("$e[J")
+        if ($favIdx.Count) { foreach ($l in Render-Panel '★ Favoritos' $favIdx $favTop $favRows $width) { [void]$sb.Append("$l$e[K`n") } }
+        if ($recIdx.Count) { foreach ($l in Render-Panel 'Recentes' $recIdx $recTop $recRows $width) { [void]$sb.Append("$l$e[K`n") } }
+        [void]$sb.Append("$e[J$e[?2026l")
         [Console]::Write($sb.ToString())
 
+        if ($null -eq $accounts) { Load-Accounts; continue }
+
+        # Processa todas as teclas já digitadas antes de redesenhar: segurar ↓ ou digitar rápido não acumula fila.
         $k = Wait-Key
-        if (-not $k) { continue }
-        $ctrl = $k.Modifiers -band [ConsoleModifiers]::Control
-        $page = [Math]::Max(1, $(if ($sel -lt $favIdx.Count) { $favRows } else { $recRows }))
-        switch ($k.Key) {
-            'Escape'    { if ($filter) { $filter = ''; $sel = 0 } else { return } ; continue }
-            'UpArrow'   { if ($sel -gt 0) { $sel-- }; continue }
-            'DownArrow' { if ($sel -lt $view.Count - 1) { $sel++ }; continue }
-            'PageUp'    { $sel = [Math]::Max(0, $sel - $page); continue }
-            'PageDown'  { $sel = [Math]::Max(0, [Math]::Min($view.Count - 1, $sel + $page)); continue }
-            'Home'      { $sel = 0; continue }
-            'End'       { $sel = [Math]::Max(0, $view.Count - 1); continue }
-            'Backspace' { if ($filter) { $filter = $filter.Substring(0, $filter.Length - 1); $sel = 0 }; continue }
-            'Enter' {
-                $target = if ($view.Count) { $view[$sel].Path } elseif ($filter -and (Test-Path -LiteralPath $filter -PathType Container)) { (Resolve-Path -LiteralPath $filter).Path }
-                if ($target) {
-                    if (-not (Test-Path -LiteralPath $target -PathType Container)) { continue }
-                    $acc = if ($accounts.Count -gt 1) { Select-Account $target } else { $accounts[0] }
-                    if ($acc) { Start-Claude $target $acc }
+        while ($k) {
+            $ctrl = $k.Modifiers -band [ConsoleModifiers]::Control
+            $page = [Math]::Max(1, $(if ($sel -lt $favIdx.Count) { $favRows } else { $recRows }))
+            $changed = $false
+            switch ($k.Key) {
+                'Escape'    { if ($filter) { $filter = ''; $sel = 0; $changed = $true } else { return } }
+                'UpArrow'   { if ($sel -gt 0) { $sel-- } }
+                'DownArrow' { if ($sel -lt $view.Count - 1) { $sel++ } }
+                'PageUp'    { $sel = [Math]::Max(0, $sel - $page) }
+                'PageDown'  { $sel = [Math]::Max(0, [Math]::Min($view.Count - 1, $sel + $page)) }
+                'Home'      { $sel = 0 }
+                'End'       { $sel = [Math]::Max(0, $view.Count - 1) }
+                'Backspace' { if ($filter) { $filter = $filter.Substring(0, $filter.Length - 1); $sel = 0; $changed = $true } }
+                'Enter' {
+                    $target = if ($view.Count) { $view[$sel].Path } elseif ($filter -and (Test-Path -LiteralPath $filter -PathType Container)) { (Resolve-Path -LiteralPath $filter).Path }
+                    if ($target -and (Test-Path -LiteralPath $target -PathType Container)) {
+                        $acc = if ($accounts.Count -gt 1) { Select-Account $target } else { $accounts[0] }
+                        if ($acc) { Start-Claude $target $acc }
+                    }
                 }
-                continue
+                default {
+                    if ($ctrl -and $k.Key -eq 'F') {
+                        if ($view.Count) {
+                            $path = $view[$sel].Path
+                            $existing = @($favorites | Where-Object { (Get-Key $_) -eq (Get-Key $path) })
+                            if ($existing) { foreach ($x in $existing) { [void]$favorites.Remove($x) } } else { $favorites.Add($path) }
+                            Save-Favorites $favorites
+                            $all = Build-Items
+                            $focusPath = $path
+                            $changed = $true
+                        }
+                    }
+                    elseif ($ctrl -and $k.Key -eq 'C') { return }
+                    elseif (-not $ctrl -and $k.KeyChar -and -not [char]::IsControl($k.KeyChar)) { $filter += $k.KeyChar; $sel = 0; $changed = $true }
+                }
             }
+            if ($changed) { . $refreshView }
+            $k = if ([Console]::KeyAvailable) { [Console]::ReadKey($true) }
         }
-        if ($ctrl -and $k.Key -eq 'F' -and $view.Count) {
-            $path = $view[$sel].Path
-            $existing = @($favorites | Where-Object { (Get-Key $_) -eq (Get-Key $path) })
-            if ($existing) { foreach ($x in $existing) { [void]$favorites.Remove($x) } } else { $favorites.Add($path) }
-            Save-Favorites $favorites
-            $all = Build-Items
-            $focusPath = $path
-            continue
-        }
-        if ($ctrl -and $k.Key -eq 'C') { return }
-        if (-not $ctrl -and $k.KeyChar -and -not [char]::IsControl($k.KeyChar)) { $filter += $k.KeyChar; $sel = 0 }
     }
 }
 finally {
