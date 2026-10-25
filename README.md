@@ -51,6 +51,8 @@ O topo da lista mostra o uso da sessão (5h) e da semana de cada conta. Na tela 
 
 A última conta usada vem pré-selecionada (`~/.claudio/state.json`).
 
+`claudio --usage` só imprime os cards de uso de cada conta e sai, sem abrir a lista.
+
 Origem do uso, por tipo de token:
 
 - token de `/login` (escopo `user:profile`): `GET /api/oauth/usage`, o mesmo dado do `/usage`;

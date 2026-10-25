@@ -266,10 +266,6 @@ function Load-Accounts {
     $script:lastAccount = (Read-Json $stateFile).account
 }
 
-$recent = @(Get-RecentDirs)
-$favorites = [System.Collections.Generic.List[string]]::new()
-foreach ($f in Load-Favorites) { $favorites.Add($f) }
-
 # Lower e Meta saem prontos daqui: o filtro e o desenho rodam a cada tecla.
 function New-Row([string]$path, [datetime]$last, [int]$count, [bool]$fav) {
     $meta = if ($count) { '{0,9} · {1,-11}' -f ('há ' + (Format-Ago $last)), ('{0} {1}' -f $count, $(if ($count -eq 1) { 'sessão' } else { 'sessões' })) } else { '' }
@@ -415,6 +411,21 @@ function Start-Claude([string]$target, $acc) {
     & claude --dangerously-skip-permissions @scriptArgs
     exit $LASTEXITCODE
 }
+
+# claudio --usage: imprime o card de uso de cada conta e sai.
+if ($scriptArgs -contains '--usage') {
+    $accounts = @(Get-Accounts)
+    foreach ($a in $accounts) { try { Start-Usage $a } catch { $a.State = 'erro'; $a.Note = "$_" } }
+    # Complete-Usage pode disparar a segunda consulta (chamada de 1 token): espera até não sobrar Task.
+    while ($accounts | Where-Object Task) { [void](Update-Usage); Start-Sleep -Milliseconds 20 }
+    $width = [Math]::Max(60, $(try { [Console]::WindowWidth - 1 } catch { 100 }))
+    foreach ($a in $accounts) { foreach ($l in Render-Account $a $false $width) { [Console]::WriteLine($l) } }
+    exit 0
+}
+
+$recent = @(Get-RecentDirs)
+$favorites = [System.Collections.Generic.List[string]]::new()
+foreach ($f in Load-Favorites) { $favorites.Add($f) }
 
 $all = Build-Items
 $filter = ''
